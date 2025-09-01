@@ -1,0 +1,13 @@
+default_severity: medium
+exceptions:
+- expires_at: '2025-12-31'
+  id: example_exception
+  reason: Temporary exception for migration
+  rules:
+  - aws.security.no_ssh_from_anywhere
+fail_on:
+- high
+- critical
+providers:
+- aws
+version: 1
