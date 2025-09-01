@@ -1,0 +1,132 @@
+name: Terraform CI/CD
+
+on:
+  pull_request:
+    paths: 
+      - "terraform/**"
+      - "policies/**"
+      - ".inframorph-policy.yaml"
+      - "scripts/**"
+  push:
+    branches: ["main"]
+    paths: ["terraform/**"]
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write  # For OIDC
+
+env:
+  TF_INPUT: false
+  TF_IN_AUTOMATION: true
+
+jobs:
+  plan-and-policy:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}  # For OIDC
+          # Alternative: use access keys
+          # aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          # aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+
+      - name: Terraform Init (dev)
+        working-directory: terraform/envs/dev
+        run: terraform init -upgrade
+
+      - name: Terraform Format Check
+        working-directory: terraform/envs/dev
+        run: terraform fmt -check
+
+      - name: Terraform Validate
+        working-directory: terraform/envs/dev
+        run: terraform validate
+
+      - name: Terraform Plan (dev)
+        working-directory: terraform/envs/dev
+        run: |
+          terraform plan -out=tfplan.bin -detailed-exitcode || true
+          echo "PLAN_EXIT_CODE=$?" >> $GITHUB_ENV
+
+      - name: Export Plan JSON
+        if: env.PLAN_EXIT_CODE != '1'
+        run: |
+          bash scripts/export_tfplan_json.sh terraform/envs/dev/tfplan.bin terraform/envs/dev/tfplan.json
+
+      - name: Install Conftest
+        run: |
+          curl -L https://github.com/open-policy-agent/conftest/releases/download/v0.56.0/conftest_Linux_x86_64.tar.gz | tar xz
+          sudo mv conftest /usr/local/bin/
+
+      - name: Policy Check
+        if: env.PLAN_EXIT_CODE != '1'
+        run: |
+          conftest test terraform/envs/dev/tfplan.json --policy policies --output json > conftest.json || true
+          python3 scripts/summarize_conftest.py conftest.json > policy_summary.md
+
+      - name: Post PR Comment
+        if: github.event_name == 'pull_request' && env.PLAN_EXIT_CODE != '1'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          recreate: true
+          path: policy_summary.md
+
+      - name: Check for Blocking Violations
+        if: env.PLAN_EXIT_CODE != '1'
+        run: |
+          python3 scripts/check_exceptions.py conftest.json .inframorph-policy.yaml
+
+      - name: Upload Plan Artifact
+        if: env.PLAN_EXIT_CODE == '2'
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: |
+            terraform/envs/dev/tfplan.bin
+            terraform/envs/dev/tfplan.json
+            policy_summary.md
+
+  apply:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production  # Requires manual approval
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+
+      - name: Terraform Init (prod)
+        working-directory: terraform/envs/prod
+        run: terraform init -upgrade
+
+      - name: Terraform Plan (prod)
+        working-directory: terraform/envs/prod
+        run: terraform plan
+
+      - name: Terraform Apply (prod)
+        working-directory: terraform/envs/prod
+        run: terraform apply -auto-approve
